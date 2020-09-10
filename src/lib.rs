@@ -3,8 +3,7 @@
 //! relatively simple logging needs and particularly for applications that can define
 //! their logging needs at compile time. It is built on top of the [`log`] crate.
 //!
-//! It is not recommended to use the [`log`] crate directly in conjuntion with this crate.
-//! Instead, this crate re-exports `log`'s items.
+//! This crate re-exports `log`'s items, so it is not necessary to depend on [`log`] directly.
 //!
 //! # Example
 //!
@@ -12,13 +11,19 @@
 //! // Build and initialize some (arbitrary for the sake of example) logger.
 //! use tylog::Level::{Error, Info, Debug, Trace};
 //! tylog::new_logger()
+//!     // Can enable logs for specific targets.
+//!     .for_targets(tylog::this_crate!())
 //!     .with_format("{level} {msg}")
-//!     // Can enable just a specific level for a target.
+//!     // Can enable just a specific level for a destination.
 //!     .enable_stdout(Info)
-//!     // Can enable a range of levels for a target.
+//!     // Can enable a range of levels for a destination.
 //!     .enable_stderr(Error..Info) // Note: exclusive range exludes Info
+//!     // Can enable for a single target.
+//!     .for_targets("foo")
 //!     .with_format("{time} {level} {fileLineOrFile} - {msg}")
 //!     .enable_file(Error..=Info, "./foo.log")?
+//!     // Can enable for multiple targets.
+//!     .for_targets(tylog::TargetFilter::new(&["reqwest", "serde", tylog::this_crate!()]))
 //!     .enable_file(Debug.., "./debug_trace.log")?
 //!     .enable_file(.., "./everything.log")?
 //!     // Can enable a specific set of levels, excluding all others.
@@ -98,6 +103,26 @@ pub const DEFAULT_TIME_FORMAT: &str = "%0Y-%0m-%0d %0H:%0M:%0S %0z";
 pub const DEFAULT_LEVEL_STRINGS: LevelStrings = LevelStrings {
     strings: ["", "[ERROR]", "[WARN] ", "[INFO] ", "[DEBUG]", "[TRACE]"],
 };
+
+/// The default targets. Allows logs from any target.
+pub const ALL_TARGETS: TargetFilter = TargetFilter {
+    targets: &[""]
+};
+
+/// Evaluates to the name of the crate where the macro is evaluated. Inteded to be used with [`for_targets`]
+/// 
+/// [`for_targets`]: struct.LogBuilder.html#method.for_targets
+#[macro_export]
+macro_rules! this_crate {
+    () => { env!("CARGO_PKG_NAME") }
+}
+
+// Note: CARGO_PKG_NAME, CARGO_BIN_NAME, etc, return "tylog" even when built as a dep of another crate
+// pub const CRATE_TARGET: TargetFilter = TargetFilter {
+//     targets: &[CRATE_NAME]
+// };
+
+// pub const CRATE_NAME: &str = env!("CARGO_BIN_NAME");
 
 /// A convenience trait for types which can be passed as a list of [`log::Level`]s.
 ///
@@ -305,15 +330,59 @@ impl<T: SharedWrite> SharedWrite for &T {
     }
 }
 
-struct LogTarget {
+/// A target filter applied to incoming logs.
+#[derive(Copy, Clone)]
+pub struct TargetFilter {
+    targets: &'static [&'static str],
+}
+
+impl Into<TargetFilter> for &str {
+    fn into(self) -> TargetFilter {
+        self.to_owned().into()
+    }
+}
+
+impl Into<TargetFilter> for String {
+    fn into(self) -> TargetFilter {
+        let targets = &*Box::leak(vec![&*Box::leak(self.into_boxed_str())].into_boxed_slice());
+        TargetFilter { targets }
+    }
+}
+
+impl Into<TargetFilter> for &[&str] {
+    fn into(self) -> TargetFilter {
+        let targets: Vec<&'static str> = self.iter().map(|&s| &*Box::leak(s.to_owned().into_boxed_str())).collect();
+        let targets = &*Box::leak(targets.into_boxed_slice());
+        TargetFilter { targets }
+    }
+}
+
+impl TargetFilter {
+    fn enabled_for(&self, for_target: &str) -> bool {
+        self.targets.iter().any(|target| {
+            target.is_empty()
+                || target
+                    .strip_prefix(for_target)
+                    .map(|stripped| stripped.is_empty() || stripped.starts_with("::"))
+                    .unwrap_or(false)
+        })
+    }
+    /// Creates a new TargetFilter from the static data provided
+    pub fn new(targets: &'static [&'static str]) -> Self {
+        Self { targets }
+    }
+}
+
+struct Log {
     writer: &'static dyn SharedWrite,
     fmt: &'static [FmtPart],
     /// This ends up being a double-deref. I'm doing this becuase
-    /// we need to hash this field for each target. Hashing one &(Sized)
+    /// we need to hash this field for each log. Hashing one &(Sized)
     /// is much better than [&(!Sized); 6]. Note, this has not been
     /// performance tested.
     lvl_strings: &'static LevelStrings,
     enabled: EnabledLevels,
+    targets: TargetFilter,
 }
 
 #[doc(hidden)]
@@ -358,12 +427,13 @@ impl std::ops::Index<log::Level> for LevelStrings {
 pub struct LogBuilder {
     current_fmt: &'static [FmtPart],
     current_lvl_strings: &'static LevelStrings,
+    current_target_filter: TargetFilter,
     // Memoize formats. Important for later memoizing formatted log messages.
     known_fmts: HashMap<String, &'static [FmtPart]>,
     // Memoize level strings. Important for later memoizing formatted log messages.
     known_lvl_strings: Vec<&'static LevelStrings>,
-    file_targets: HashMap<PathBuf, LogTarget>,
-    other_targets: Vec<LogTarget>,
+    file_logs: HashMap<PathBuf, Log>,
+    other_logs: Vec<Log>,
 }
 
 impl Default for LogBuilder {
@@ -376,10 +446,11 @@ impl Default for LogBuilder {
         LogBuilder {
             current_fmt,
             current_lvl_strings,
+            current_target_filter: ALL_TARGETS,
             known_fmts,
             known_lvl_strings,
-            file_targets: HashMap::new(),
-            other_targets: vec![],
+            file_logs: HashMap::new(),
+            other_logs: vec![],
         }
     }
 }
@@ -411,6 +482,7 @@ impl LogBuilder {
     /// * `{Line}` - the line which triggered the log. This may be absent.
     /// * `{FileLine}` - the file and line, if both are present. Formatted as `relative/path/to/foo.rs:42`.
     /// * `{FileLineOrFile}` - the same as `{FileLine}` if both are present, otherwise the same as `{File}`.
+    /// * `{Target}` - the target of the log.
     ///
     /// [`DEFAULT_LOG_FORMAT`]: constant.DEFAULT_LOG_FORMAT.html
     /// [`DEFAULT_TIME_FORMAT`]: constant.DEFAULT_TIME_FORMAT.html
@@ -425,6 +497,15 @@ impl LogBuilder {
             self.known_fmts.insert(format.to_owned(), fmt);
             fmt
         };
+        self
+    }
+    /// Use the given target filter for yet-to-be-enabled logs. Any logs enabled prior ot this call will use the prior targets, or [`ALL_TARGETS`] if
+    /// this method was never called.
+    /// 
+    /// [`ALL_TARGETS`]: constant.ALL_TARGETS.html
+    #[must_use = "Note: the .init() method must be called to actually enable logging"]
+    pub fn for_targets(mut self, targets: impl Into<TargetFilter>) -> Self {
+        self.current_target_filter = targets.into();
         self
     }
     /// Use the given level strings for yet-to-be-enabled logs. Any logs enabled prior to this call will use the prior level strings, or [`DEFAULT_LEVEL_STRINGS`]
@@ -480,11 +561,12 @@ impl LogBuilder {
         mut self,
         levels: impl IntoLevelIter<I>,
     ) -> Self {
-        self.other_targets.push(LogTarget {
+        self.other_logs.push(Log {
             writer: &Stdout,
             lvl_strings: self.current_lvl_strings,
             fmt: self.current_fmt,
             enabled: EnabledLevels::from(levels),
+            targets: self.current_target_filter,
         });
         self
     }
@@ -503,11 +585,12 @@ impl LogBuilder {
         mut self,
         levels: impl IntoLevelIter<I>,
     ) -> Self {
-        self.other_targets.push(LogTarget {
+        self.other_logs.push(Log {
             writer: &Stderr,
             lvl_strings: self.current_lvl_strings,
             fmt: self.current_fmt,
             enabled: EnabledLevels::from(levels),
+            targets: self.current_target_filter,
         });
         self
     }
@@ -532,7 +615,7 @@ impl LogBuilder {
         path: impl AsRef<Path>,
     ) -> std::io::Result<Self> {
         let full_path = canonicalize_file_path(path.as_ref())?;
-        if self.file_targets.contains_key(&full_path) {
+        if self.file_logs.contains_key(&full_path) {
             // Intentially using (non-canonicolized) path in error message
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -547,14 +630,15 @@ impl LogBuilder {
             .create(true)
             .open(&full_path)?;
         if self
-            .file_targets
+            .file_logs
             .insert(
                 full_path,
-                LogTarget {
+                Log {
                     writer: Box::leak(Box::new(file)),
                     fmt: self.current_fmt,
                     lvl_strings: self.current_lvl_strings,
                     enabled: EnabledLevels::from(levels),
+                    targets: self.current_target_filter,
                 },
             )
             .is_some()
@@ -565,11 +649,11 @@ impl LogBuilder {
     }
     /// Initialize the logger. There can only be one logger, and this will fail if one was already set.
     pub fn init(self) -> Result<(), log::SetLoggerError> {
-        let mut logs = self.other_targets;
-        logs.reserve(self.file_targets.len());
-        logs.extend(self.file_targets.into_iter().map(|(_, v)| v));
+        let mut logs = self.other_logs;
+        logs.reserve(self.file_logs.len());
+        logs.extend(self.file_logs.into_iter().map(|(_, v)| v));
         let mut all_enabled = EnabledLevels::default();
-        for LogTarget { enabled, .. } in &logs {
+        for Log { enabled, .. } in &logs {
             all_enabled.merge(enabled);
         }
         let max_enabled = all_enabled.max();
@@ -585,7 +669,7 @@ impl LogBuilder {
 
 struct Logger {
     enabled: EnabledLevels,
-    logs: Vec<LogTarget>,
+    logs: Vec<Log>,
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -598,6 +682,7 @@ enum FmtPart {
     Line,
     FileLine,
     FileLineOrFile,
+    Target,
 }
 
 impl log::Log for Logger {
@@ -606,11 +691,10 @@ impl log::Log for Logger {
     }
     fn log(&self, record: &log::Record) {
         let mut memoizer = MemoizingLogFormatter::new(record);
-        for target in &self.logs {
-            if target.enabled[record.level()] {
-                let formatted = memoizer.format(target.fmt, target.lvl_strings);
-                target
-                    .writer
+        for log in &self.logs {
+            if log.enabled[record.level()] && log.targets.enabled_for(record.target()) {
+                let formatted = memoizer.format(log.fmt, log.lvl_strings);
+                log.writer
                     .write_all(formatted.as_bytes())
                     .unwrap_or_else(drop);
             }
@@ -711,6 +795,7 @@ impl<'r> MemoizingLogFormatter<'r> {
                         (Some(file), None) => out += file,
                         _ => {}
                     },
+                    FmtPart::Target => write!(out, "{}", record.target()).unwrap_or_else(drop),
                 }
             }
             out += "\n";
@@ -766,6 +851,8 @@ fn build_static_format_parts(format_str: &str) -> &'static [FmtPart] {
             FmtPart::FileLine
         } else if tag_ident.eq_ignore_ascii_case("FileLineOrFile") {
             FmtPart::FileLineOrFile
+        } else if tag_ident.eq_ignore_ascii_case("Target") {
+            FmtPart::Target
         } else {
             panic!("Unrecognized tag '{}'", tag_ident);
         };
@@ -785,7 +872,6 @@ fn build_static_format_parts(format_str: &str) -> &'static [FmtPart] {
     }
 
     let (remaining, v) = many1(part)(format_str).unwrap();
-    let v: Vec<FmtPart> = v;
     assert!(remaining.is_empty());
 
     Box::leak(v.into_boxed_slice())
